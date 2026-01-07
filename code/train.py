@@ -1,0 +1,234 @@
+import torch
+import torch.utils.data as D
+import torch.nn.functional as F
+from data_loader import Load
+from config import FLAGS
+from model_bert import BertED
+from torch.optim import AdamW
+import torch.nn as nn
+from exemplar import Exemplar
+from copy import deepcopy
+import os
+import gc
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
+class Trainer:
+    def __init__(self, total_cls):
+        # Clear CUDA cache before initialization
+        if FLAGS.gpu and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        
+        self.total_cls = total_cls
+        self.seen_cls = 0
+        self.model = BertED(total_cls)
+        if FLAGS.gpu:
+            self.model = self.model.cuda()
+        param_optimizer = list(self.model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+            {'params': [p for n, p in param_optimizer if any(
+                nd in n for nd in no_decay)], 'weight_decay': 0.0}]
+        self.optimizer = AdamW(optimizer_grouped_parameters, lr=FLAGS.lr, eps=FLAGS.adam_epsilon)
+
+    def train(self, batch_size, epoches, max_size):
+        total_cls = self.total_cls
+        criterion = nn.CrossEntropyLoss()
+        distill_criterion = nn.CosineEmbeddingLoss()
+        exemplar = Exemplar(max_size, total_cls)
+        self.previous_model = None
+
+        load = Load()
+        label2id, id2label = load.label2id, load.id2label
+        print('The number of labels:', len(label2id))
+        print('load data……')
+        data_x_train, data_mask_train, data_y_train = load.load_data_bert(FLAGS.data_path)
+        data_x_test, data_mask_test, data_y_test = load.load_data_bert(FLAGS.data_path.replace('train', 'test'))
+        print('load successfully!')
+        test_xs = []
+        test_masks = []
+        test_ys = []
+        test_fs = []
+        for inc_i in range(FLAGS.task_num):
+            print("Incremental num : ", inc_i)
+            test_xs.extend(data_x_test[inc_i])
+            test_masks.extend(data_mask_test[inc_i])
+            test_ys.extend(data_y_test[inc_i])
+
+            train_xs, train_masks, train_ys = exemplar.get_exemplar_train()
+            train_xs.extend(data_x_train[inc_i])
+            train_masks.extend(data_mask_train[inc_i])
+            train_ys.extend(data_y_train[inc_i])
+
+            train_xss = torch.LongTensor(train_xs)
+            train_maskss = torch.LongTensor(train_masks)
+            train_yss = torch.LongTensor(train_ys)
+            test_xss = torch.LongTensor(test_xs)
+            test_maskss = torch.LongTensor(test_masks)
+            test_yss = torch.LongTensor(test_ys)
+
+            train_dataset = D.TensorDataset(train_xss, train_maskss, train_yss)
+            train_dataloader = D.DataLoader(train_dataset, batch_size, True, num_workers=5)
+            test_dataset = D.TensorDataset(test_xss, test_maskss, test_yss)
+            test_dataloader = D.DataLoader(test_dataset, batch_size, False, num_workers=5)
+
+            # CRITICAL FIX: seen_cls should be the max label ID in all data seen so far
+            # Flatten the list of lists to get all labels
+            all_train_labels = [label for seq in train_ys for label in seq]
+            all_test_labels = [label for seq in test_ys for label in seq]
+            max_train_label = max(all_train_labels) if all_train_labels else 0
+            max_test_label = max(all_test_labels) if all_test_labels else 0
+            self.seen_cls = max(max_train_label, max_test_label)
+            
+            print(f"Task {inc_i}: seen_cls updated to {self.seen_cls} (max label in current data)")
+            print(f"Number of unique labels in train: {len(set(all_train_labels))}")
+            print(f"Number of unique labels in test: {len(set(all_test_labels))}")
+            test_f = []
+            for epoch in range(epoches):
+                print("Epoch", epoch)
+                self.model.train()
+                if inc_i > 0:
+                    self.stage1_distill(train_dataloader, criterion, distill_criterion)
+                else:
+                    self.stage1(train_dataloader, criterion)
+                p, r, f = self.test(test_dataloader)
+                test_f.append(f)
+            exemplar.update(1, data_x_train[inc_i], data_mask_train[inc_i], data_y_train[inc_i], self.model, batch_size)
+            self.previous_model = deepcopy(self.model)
+            p, r, f = self.test(test_dataloader)
+            test_f.append(f)
+            test_fs.append(max(test_f))
+            print(test_fs)
+
+
+    def stage1(self, train_dataloader, criterion):
+        total_loss = 0
+        self.model.train()
+        for batch_idx, (train_X, train_mask, train_Y) in enumerate(train_dataloader):
+                self.optimizer.zero_grad()
+                
+                # Debug: Check label validity BEFORE moving to GPU
+                max_label = train_Y.max().item()
+                min_label = train_Y.min().item()
+                unique_labels = torch.unique(train_Y).tolist()
+                
+                if batch_idx == 0:
+                    print(f"Batch {batch_idx}: Label range [{min_label}, {max_label}]")
+                    print(f"seen_cls={self.seen_cls}, total_cls={self.total_cls}")
+                    print(f"Model output classes: {self.seen_cls+1} (indices 0 to {self.seen_cls})")
+                
+                # CRITICAL FIX: Labels must be in valid range [0, seen_cls]
+                if max_label > self.seen_cls or min_label < 0:
+                    print(f"ERROR at batch {batch_idx}: Label range [{min_label}, {max_label}] exceeds valid range [0, {self.seen_cls}]")
+                    print(f"All unique labels: {sorted(set(unique_labels))}")
+                    print(f"This will cause CUDA assert error - SKIPPING batch")
+                    continue
+                
+                if FLAGS.gpu:
+                    train_X = train_X.cuda(non_blocking=True)
+                    train_mask = train_mask.cuda(non_blocking=True)
+                    train_Y = train_Y.cuda(non_blocking=True)
+                
+                logits, _ = self.model(train_X, train_mask)
+                p = logits[:, :, :self.seen_cls+1]
+                loss = criterion(p.view(-1, self.seen_cls+1), train_Y.view(-1))
+                
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: Invalid loss at batch {batch_idx}, skipping...")
+                    continue
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+                
+                # Cleanup
+                del train_X, train_mask, train_Y, logits, p, loss
+        
+        if FLAGS.gpu:
+            torch.cuda.empty_cache()
+        print("Loss: {:.6f}".format(total_loss / max(1, len(train_dataloader))))
+
+
+    def stage1_distill(self, train_dataloader, criterion, distill_criterion):
+        total_loss = 0
+        T = 2
+        self.model.train()
+        for train_X, train_mask, train_Y in train_dataloader:
+            self.optimizer.zero_grad()
+            
+            if FLAGS.gpu:
+                train_X = train_X.cuda(non_blocking=True)
+                train_mask = train_mask.cuda(non_blocking=True)
+                train_Y = train_Y.cuda(non_blocking=True)
+            
+            logits, output = self.model(train_X, train_mask)
+            normalized_output = F.normalize(output.view(-1, output.size()[2]), p=2, dim=1)
+            p = logits[:, :, :self.seen_cls+1]
+            with torch.no_grad():
+                pre_p, pre_output = self.previous_model(train_X, train_mask)
+                normalized_pre_out = F.normalize(pre_output.view(-1, pre_output.size()[2]), p=2, dim=1)
+                pre_p = F.softmax(pre_p[:, :, :self.seen_cls] / T, dim=2)
+                pre_p = pre_p.view(-1, self.seen_cls)
+            logp = F.log_softmax(p[:, :, :self.seen_cls] / T, dim=2).view(-1, self.seen_cls)
+            loss_soft_target = -torch.mean(torch.sum(pre_p * logp, dim=1))
+            loss_hard_target = criterion(p.view(-1, self.seen_cls+1), train_Y.view(-1))
+            distill_loss = distill_criterion(normalized_output, normalized_pre_out, torch.ones(train_X.size(0)*train_X.size(1)).cuda())
+            loss = loss_soft_target * 0.8 + 1 * loss_hard_target + 0.7*distill_loss
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            
+            del train_X, train_mask, train_Y, logits, output, p, loss
+        
+        if FLAGS.gpu:
+            torch.cuda.empty_cache()
+        print("Loss: {:.6f}".format(total_loss / len(train_dataloader)))
+
+
+    def test(self, test_dataloader):
+        self.model.eval()
+        with torch.no_grad():
+            golds = list()
+            predicteds = list()
+            for test_X, test_mask, test_Y in test_dataloader:
+                if FLAGS.gpu:
+                    test_X = test_X.cuda()
+                    test_mask = test_mask.cuda()
+                    test_Y = test_Y.cuda()
+                logits, _ = self.model(test_X, test_mask)
+                logits = logits[:, :, :self.seen_cls+1]
+                predicted_y = torch.argmax(logits, -1).view(-1)
+                predicteds.extend(list(predicted_y.cpu().numpy()))
+                golds.extend(list(test_Y.view(-1).cpu().numpy()))
+            c_predict = 0
+            c_correct = 0
+            c_gold = 0
+            for g, p in zip(golds, predicteds):
+                if g != 0:
+                    c_gold += 1
+                if p != 0:
+                    c_predict += 1
+                if g != 0 and p != 0 and p == g:
+                    c_correct += 1
+            p = c_correct / (c_predict + 1e-100)
+            r = c_correct / c_gold
+            f = 2 * p * r / (p + r + 1e-100)
+            print('correct', c_correct, 'predicted', c_predict, 'golden', c_gold)
+            return p, r, f
+
+
+if __name__ == "__main__":
+    trainer = Trainer(FLAGS.total_cls)
+    trainer.train(FLAGS.batch_size, FLAGS.n_epochs, FLAGS.max_size)
+
+

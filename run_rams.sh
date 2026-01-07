@@ -1,0 +1,15 @@
+python code/train.py \
+    --data_folder ./data/rams \
+    --data_path ./data/rams/train_data \
+    --n_epochs 15 \
+    --lr 2e-05 \
+    --batch_size 16 \
+    --dropout 0.1 \
+    --gradient_accumulation_steps 1 \
+    --warmup_proportion 0.1 \
+    --adam_epsilon 1e-7 \
+    --total_cls 141 \
+    --task_num 5 \
+    --max_size 141 \
+    --weight_decay 0 \
+    --gpu
