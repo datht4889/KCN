@@ -1,4 +1,4 @@
-python code/train.py \
+CUDA_VISIBLE_DEVICES=1 python code/train.py \
     --data_folder ./data/rams \
     --data_path ./data/rams/train_data \
     --n_epochs 15 \
